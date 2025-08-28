@@ -33,40 +33,45 @@ print("Currently enabled native sdp backends:", enabled_backends)
 
 try:
     # raise NotImplementedError
+    # 尝试导入 xformers 库里的高效注意力实现
     from xformers.ops import memory_efficient_attention as xformers_attn_func
     print('Xformers is installed!')
 except:
     print('Xformers is not installed!')
-    xformers_attn_func = None
+    xformers_attn_func = None  # 设置为 None，表示不可用
 
 try:
     # raise NotImplementedError
+    # 尝试导入 flash-attn 库里的注意力实现
     from flash_attn import flash_attn_varlen_func, flash_attn_func
     print('Flash Attn is installed!')
 except:
     print('Flash Attn is not installed!')
-    flash_attn_varlen_func = None
+    flash_attn_varlen_func = None  # 设置为 None，后续代码可以判断它是否可用
     flash_attn_func = None
 
 try:
     # raise NotImplementedError
+    # 尝试导入 sageattention 库
     from sageattention import sageattn_varlen, sageattn
     print('Sage Attn is installed!')
 except:
     print('Sage Attn is not installed!')
-    sageattn_varlen = None
+    sageattn_varlen = None  # 设置为空，避免后续调用时报错
     sageattn = None
 
 
+# 获取一个日志记录器，名字就是当前模块名
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 def pad_for_3d_conv(x, kernel_size):
-    b, c, t, h, w = x.shape
-    pt, ph, pw = kernel_size
-    pad_t = (pt - (t % pt)) % pt
-    pad_h = (ph - (h % ph)) % ph
-    pad_w = (pw - (w % pw)) % pw
+    b, c, t, h, w = x.shape  # 解包输入张量的维度：batch, channel, time, height, width
+    pt, ph, pw = kernel_size  # 解包卷积核在时间、高度、宽度上的大小
+    pad_t = (pt - (t % pt)) % pt  # 计算时间维度需要补多少（保证能被 pt 整除）
+    pad_h = (ph - (h % ph)) % ph  # 计算高度维度需要补多少
+    pad_w = (pw - (w % pw)) % pw  # 计算宽度维度需要补多少
+    # 使用 replicate 模式（边缘复制）在 (w,h,t) 维度进行补齐
     return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, pad_t), mode='replicate')
 
 
@@ -76,167 +81,258 @@ def center_down_sample_3d(x, kernel_size):
     # xp = einops.rearrange(x, 'b c (t pt) (h ph) (w pw) -> (pt ph pw) b c t h w', pt=pt, ph=ph, pw=pw)
     # xc = xp[cp]
     # return xc
+
+    # 现在直接用平均池化 (avg_pool3d) 来实现下采样
     return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 
 def get_cu_seqlens(text_mask, img_len):
-    batch_size = text_mask.shape[0]
-    text_len = text_mask.sum(dim=1)
-    max_len = text_mask.shape[1] + img_len
+    batch_size = text_mask.shape[0]   # batch 大小
+    text_len = text_mask.sum(dim=1)   # 每个样本中有效文本 token 的数量
+    max_len = text_mask.shape[1] + img_len  # 文本最大长度 + 图像长度
 
+    # 初始化 cu_seqlens，大小是 (2*batch_size+1)，放在 GPU 上
     cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
 
+    # 遍历 batch，依次计算 cu_seqlens
     for i in range(batch_size):
-        s = text_len[i] + img_len
-        s1 = i * max_len + s
-        s2 = (i + 1) * max_len
+        s = text_len[i] + img_len  # 当前样本的实际序列长度
+        s1 = i * max_len + s       # 累积到当前序列的起点
+        s2 = (i + 1) * max_len     # 下一个序列的边界
         cu_seqlens[2 * i + 1] = s1
         cu_seqlens[2 * i + 2] = s2
 
-    return cu_seqlens
+    return cu_seqlens  # 返回累积序列长度（通常给高效注意力函数用）
 
 
 def apply_rotary_emb_transposed(x, freqs_cis):
+    # freqs_cis: 旋转位置编码频率，通常形状 (..., dim)
+    # 将 freqs_cis 在最后一维拆成 cos 和 sin
     cos, sin = freqs_cis.unsqueeze(-2).chunk(2, dim=-1)
+    # 把 x 的最后一维拆成实部和虚部
     x_real, x_imag = x.unflatten(-1, (-1, 2)).unbind(-1)
+    # 做旋转（复数乘法的效果： (a+bi)*exp(iθ) = a cosθ - b sinθ + i(a sinθ + b cosθ)）
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+    # 结合 cos 和 sin 应用旋转位置编码
     out = x.float() * cos + x_rotated.float() * sin
+    # 转回原来的 dtype
     out = out.to(x)
     return out
 
 
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
+    # q, k, v 是注意力的输入张量 (query, key, value)
+    # cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv 是用于变长序列的辅助信息
+    # 这些参数在处理 padding 或可变长度序列时用到
+
+    # ---------- 情况1：没有提供 cu_seqlens / max_seqlen，说明序列长度固定 ----------
     if cu_seqlens_q is None and cu_seqlens_kv is None and max_seqlen_q is None and max_seqlen_kv is None:
+        # 如果安装了 SageAttention 库
         if sageattn is not None:
             x = sageattn(q, k, v, tensor_layout='NHD')
             return x
-
+        # 如果安装了 FlashAttention 库
         if flash_attn_func is not None:
             x = flash_attn_func(q, k, v)
             return x
-
+        # 如果安装了 xformers 库
         if xformers_attn_func is not None:
             x = xformers_attn_func(q, k, v)
             return x
 
-        x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+        # 如果以上都没装，就用 PyTorch 自带的 scaled_dot_product_attention
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),  # 调整维度，把 (B, L, H, C) 变成 (B, H, L, C)
+            k.transpose(1, 2),
+            v.transpose(1, 2)
+        ).transpose(1, 2)  # 最后再转回原始维度
         return x
 
+    # ---------- 情况2：提供了 cu_seqlens / max_seqlen，说明是变长序列 ----------
     B, L, H, C = q.shape
 
+    # 展平 batch 和序列维度，方便给变长注意力库处理
     q = q.flatten(0, 1)
     k = k.flatten(0, 1)
     v = v.flatten(0, 1)
 
+    # 优先用 SageAttention 变长版本
     if sageattn_varlen is not None:
         x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    # 否则用 FlashAttention 变长版本
     elif flash_attn_varlen_func is not None:
         x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    # 如果都没装，直接报错
     else:
         raise NotImplementedError('No Attn Installed!')
 
+    # 把 (B*L, H, C) 还原回 (B, L, H, C)
     x = x.unflatten(0, (B, L))
 
     return x
 
 
 class HunyuanAttnProcessorFlashAttnDouble:
+    # 定义一个注意力处理器类，使用 Flash Attention 双输入（图像 + 文本）机制
     def __call__(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
+        '''
+        让类实例可以像函数一样被调用，执行注意力计算
+        参数：
+        - attn: 注意力模块（包含 Q/K/V 投影和输出层）
+        - hidden_states: 输入隐藏状态（通常是图像特征）
+        - encoder_hidden_states: 编码器隐藏状态（通常是文本特征）
+        - attention_mask: 注意力掩码，里面包含序列长度信息
+        - image_rotary_emb: 图像的旋转位置编码（RoPE）
+        '''
+        # 从 attention_mask 中解包序列信息
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = attention_mask
 
+        # 对输入 hidden_states 做线性变换，得到 query/key/value
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
 
+        # 将最后一个维度展开成 (heads, head_dim)，方便做多头注意力
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
+        # 对 Q 和 K 做归一化
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
+        # 对 Q 和 K 应用旋转位置编码（RoPE），引入位置信息
         query = apply_rotary_emb_transposed(query, image_rotary_emb)
         key = apply_rotary_emb_transposed(key, image_rotary_emb)
 
+        # 对 encoder_hidden_states（文本特征）再做一次 Q/K/V 投影
         encoder_query = attn.add_q_proj(encoder_hidden_states)
         encoder_key = attn.add_k_proj(encoder_hidden_states)
         encoder_value = attn.add_v_proj(encoder_hidden_states)
 
+        # 维度展开成多头格式
         encoder_query = encoder_query.unflatten(2, (attn.heads, -1))
         encoder_key = encoder_key.unflatten(2, (attn.heads, -1))
         encoder_value = encoder_value.unflatten(2, (attn.heads, -1))
 
+        # 对 encoder 的 Q 和 K 归一化
         encoder_query = attn.norm_added_q(encoder_query)
         encoder_key = attn.norm_added_k(encoder_key)
 
+        # 把图像和文本的 Q/K/V 拼接在一起
         query = torch.cat([query, encoder_query], dim=1)
         key = torch.cat([key, encoder_key], dim=1)
         value = torch.cat([value, encoder_value], dim=1)
 
+        # 使用 Flash Attention 高效计算注意力
         hidden_states = attn_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        # 把最后两个维度展平
         hidden_states = hidden_states.flatten(-2)
 
+        # 分离出图像部分和文本部分
         txt_length = encoder_hidden_states.shape[1]
         hidden_states, encoder_hidden_states = hidden_states[:, :-txt_length], hidden_states[:, -txt_length:]
 
+        # 对图像部分通过输出层
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
+        # 对文本部分通过额外的输出层
         encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
+        # 返回处理后的图像特征和文本特征
         return hidden_states, encoder_hidden_states
 
 
 class HunyuanAttnProcessorFlashAttnSingle:
+    # 定义一个注意力处理器类，主要用于混合图像和文本的注意力计算（基于 FlashAttention）
     def __call__(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
+        '''
+        1. 拼接图像 & 文本特征，让注意力在两者之间交互。
+        2. 生成 Q、K、V 并拆分成多头。
+        3. 对图像部分的 Q、K 加 RoPE 位置编码，文本部分不加。
+        4. 调用高效变长注意力（FlashAttention 等）。
+        5. 把输出重新拆分成图像部分和文本部分返回。
+        '''
+        # 从 attention_mask 中取出 变长注意力所需的辅助信息
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = attention_mask
 
+        # 拼接 hidden_states（图像特征）和 encoder_hidden_states（文本特征）
+        # 最终 hidden_states 里包含了图像和文本的表示
         hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
 
+        # 通过 attn 模块的线性投影得到 Q、K、V
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
 
+        # 把 Q、K、V 的最后一个维度拆开成 [heads, head_dim]
+        # 形状变化: [B, L, H*D] -> [B, L, H, D]
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
+        # 对 Q、K 进行归一化（可能是 RMSNorm 或 LayerNorm）
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
+        # 获取文本的长度，用来区分图像 token 和文本 token
         txt_length = encoder_hidden_states.shape[1]
 
+        # 对图像部分的 Q 应用旋转位置编码（RoPE），文本部分保持不变
         query = torch.cat([apply_rotary_emb_transposed(query[:, :-txt_length], image_rotary_emb), query[:, -txt_length:]], dim=1)
+        # 对图像部分的 K 应用旋转位置编码（RoPE），文本部分保持不变
         key = torch.cat([apply_rotary_emb_transposed(key[:, :-txt_length], image_rotary_emb), key[:, -txt_length:]], dim=1)
 
+        # 调用变长注意力函数（可能是 FlashAttention 或其他实现）
         hidden_states = attn_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-        hidden_states = hidden_states.flatten(-2)
+        hidden_states = hidden_states.flatten(-2)  # 将 [B, L, H, D] 展平成 [B, L, H*D]
 
+        # 分开返回：前一部分是图像 token 的输出，后一部分是文本 token 的输出
         hidden_states, encoder_hidden_states = hidden_states[:, :-txt_length], hidden_states[:, -txt_length:]
 
         return hidden_states, encoder_hidden_states
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
+    '''
+    这个类的功能是 把时间步嵌入、指导嵌入和文本嵌入组合在一起，
+    形成一个统一的条件向量，用于后续模型的条件控制（比如扩散模型中的噪声预测）
+    '''
     def __init__(self, embedding_dim, pooled_projection_dim):
         super().__init__()
 
+        # 定义时间步投影模块，将时间步（timestep）转换成指定维度的表示
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+
+        # 定义时间步嵌入器，将 time_proj 的输出映射到 embedding_dim 维度
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+        # 定义指导（guidance）嵌入器，将 guidance 的 time_proj 输出映射到 embedding_dim 维度
         self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+        # 定义文本嵌入投影器，把 pooled_projection 的维度投影到 embedding_dim
+        # 这里用了 PixArtAlphaTextProjection，并指定激活函数为 SiLU
         self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
 
     def forward(self, timestep, guidance, pooled_projection):
+        # 对输入的时间步进行投影
         timesteps_proj = self.time_proj(timestep)
+        # 将投影结果送入嵌入器，并转成 pooled_projection 相同的数据类型
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
 
+        # 对指导信号 guidance 做同样的投影与嵌入
         guidance_proj = self.time_proj(guidance)
         guidance_emb = self.guidance_embedder(guidance_proj.to(dtype=pooled_projection.dtype))
 
+        # 将时间步嵌入与指导嵌入相加，得到时间-指导的联合嵌入
         time_guidance_emb = timesteps_emb + guidance_emb
 
+        # 将文本投影向量送入 text_embedder，映射到 embedding_dim
         pooled_projections = self.text_embedder(pooled_projection)
+        # 将时间-指导嵌入与文本投影嵌入相加，形成最终的条件嵌入
         conditioning = time_guidance_emb + pooled_projections
 
+        # 返回最终的条件嵌入
         return conditioning
 
 
